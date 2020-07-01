@@ -90,3 +90,4 @@ census_clean <- raw_census %>%
   mutate(age18_under = age5_under + age5_17,
          age18_34 = age18_24 + age25_34,
          age55_64 = age55_59 + age60_61 + age62_64) 
+
