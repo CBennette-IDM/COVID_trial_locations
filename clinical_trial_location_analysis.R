@@ -20,7 +20,7 @@ library(sp)
 library(spdep)
 library(INLA)
 library(kableExtra)
-
+library(usmap)
 
 #### PREP DATA ####
 
@@ -36,6 +36,7 @@ library(kableExtra)
 # load Cytel tracker data (downloaded from their website: )
 trials <- read.csv("table_trials - 2020-06-30.csv") %>%
   filter(Country == "United States") %>%
+  select(-Province) %>% 
   rename(nct_id = ID)
 
 ### AACT: oh how I've missed SQL databases
@@ -53,14 +54,17 @@ study_tbl <- tbl(src=con,'studies')
 # get locations
 location_tbl <- tbl(src=con,'facilities')
 locations <- location_tbl %>% 
-  filter(country == "United States") %>%
+  #filter(country == "United States") %>% DO NOT FILTER HERE (need to count non-US sites first)
   select(nct_id, zip) %>%
   collect()
 
 # locations for covid trials only
 trial_locations <- trials %>% 
   left_join(locations, by = "nct_id") %>%
-  filter(!is.na(zip)) %>%
+  group_by(nct_id) %>%
+  mutate(no_locations = n_distinct(zip, Country)) %>%
+  ungroup() %>%
+  filter(!is.na(zip) & Country == "United States") %>%
   mutate(zip = ifelse(nchar(zip) == 10, substr(zip, 1, 5), zip))
 
 # load census data 
@@ -86,7 +90,7 @@ universities <- read.csv("Colleges_and_Universities.csv") %>%
   filter(CLOSE_DATE == "-2") %>%
   group_by(COUNTYFIPS) %>%
   summarise(universities = n(),
-            enrollment = sum(TOT_ENROLL)) %>%
+            student_enrollment = sum(TOT_ENROLL)) %>%
   mutate(geoid = as.double(COUNTYFIPS))
 
 # count trials per zip
@@ -113,18 +117,24 @@ cases <- nytcovcounty %>%
 
 ### monthly estimates ###
 trial_counts_month <- trial_counts %>%
+  filter(!is.na(geoid)) %>%
   mutate(start = as.Date(paste0(Date, "-01"), "%Y-%B-%d"),
-           end = as.Date(paste0(Completion, "-01"), "%Y-%B-%d"),
-           march = start < '2020-03-31' & end >= '2020-03-01',
-           april = start < '2020-04-30' & end >= '2020-04-01',
-           may = start < '2020-05-31' & end >= '2020-05-01',
-           june = start < '2020-06-30' & end >= '2020-06-01') %>%
-  group_by(geoid) %>%
-  mutate(total_march = sum(march, na.rm = T),
+         end = as.Date(paste0(Completion, "-01"), "%Y-%B-%d"),
+         march = start < '2020-03-31' & end >= '2020-03-01',
+         april = start < '2020-04-30' & end >= '2020-04-01',
+         may = start < '2020-05-31' & end >= '2020-05-01',
+         june = start < '2020-06-30' & end >= '2020-06-01',
+         total_march = sum(march, na.rm = T),
          total_april = sum(april, na.rm = T),
          total_may = sum(may, na.rm = T),
          total_june = sum(june, na.rm = T)) %>%
-  select(geoid, total_march, total_april, total_may, total_june)
+  group_by(geoid) %>%
+  mutate(enrollment_march = sum(ifelse(march == 1, Size/(max(as.numeric(end-start), 1)/30.5)/no_locations, 0), na.rm = T),
+         enrollment_april = sum(ifelse(april == 1, Size/(max(as.numeric(end-start), 1)/30.5)/no_locations, 0), na.rm = T),
+         enrollment_may = sum(ifelse(may == 1, Size/(max(as.numeric(end-start), 1)/30.5)/no_locations, 0), na.rm = T),
+         enrollment_june = sum(ifelse(june == 1, Size/(max(as.numeric(end-start), 1)/30.5)/no_locations, 0), na.rm = T)) %>%
+  ungroup() %>%
+  select(geoid, total_march, total_april, total_may, total_june, enrollment_march, enrollment_april, enrollment_may, enrollment_june)
 
 trial_new_month <- trial_counts %>%
   mutate(month = month(as.Date(paste0(Date, "-01"), "%Y-%B-%d"))) %>%
@@ -140,7 +150,7 @@ trial_new_month <- trial_counts %>%
 cases_month <- cases %>%
   mutate(month = month(date)) %>%
   group_by(fips, month) %>%  
-  summarise(cases_month = max(cases)) %>%
+  summarise(cases_month = max(cases, na.rm = T)) %>%
   pivot_wider(names_from = month, values_from = cases_month) %>%
   mutate(cases_march = ifelse(is.na(`3`), 0, `3`),
          cases_april = ifelse(is.na(`4`), 0, `4`) - cases_march, # want incremental case counts
@@ -168,6 +178,10 @@ trials_census <- census_clean %>%
          launched_april = ifelse(is.na(launched_april), 0, launched_april),
          launched_may = ifelse(is.na(launched_may), 0, launched_may),
          launched_june = ifelse(is.na(launched_june), 0, launched_june),
+         enrollment_march = ifelse(is.na(enrollment_march), 0, enrollment_march),
+         enrollment_april = ifelse(is.na(enrollment_april), 0, enrollment_april),
+         enrollment_may = ifelse(is.na(enrollment_may), 0, enrollment_may),
+         enrollment_june = ifelse(is.na(enrollment_june), 0, enrollment_june),
          hospitals = ifelse(is.na(hospitals), 0, hospitals),
          hospital_beds = ifelse(is.na(hospital_beds), 0, hospital_beds),
          universities = ifelse(is.na(universities), 0, universities),
@@ -252,8 +266,27 @@ ggplot(trials_census, aes(launched_march, launched_june)) +
   geom_jitter(alpha = 0.1, color = "blue") + 
   theme_minimal()
 
-# numbers for early abstract
+#### SIMPLE PLOTS ####
+map_data <- trials_census %>%
+  mutate(ratio_march = pmin(pmax(enrollment_march / cases_march, 0, na.rm = T), 2),
+         ratio_april = pmin(pmax(enrollment_april / cases_april, 0, na.rm = T), 2),
+         ratio_may = pmin(pmax(enrollment_may / cases_may, 0, na.rm = T), 2),
+         ratio_june = pmin(pmax(enrollment_june / cases_june, 0, na.rm = T), 2))
 
+# QUICK UGLY PLOTS
+plot_usmap(data = map_data, values = "ratio_march", size = 0.1 , color = "white") + 
+  scale_fill_continuous(low = "blue", 
+                        high = "red", 
+                        name = "Enrollment to case ratio (March)", 
+                        label = scales::comma) + 
+  theme(legend.position = "right")
+
+plot_usmap(data = map_data, values = "ratio_june", size = 0.1 , color = "white") + 
+  scale_fill_continuous(low = "blue", 
+                        high = "red", 
+                        name = "Enrollment to case ratio (June)", 
+                        label = scales::comma) + 
+  theme(legend.position = "right")
 
 #### VERY SIMPLE MODELS ####
 first_date <- cases %>%
