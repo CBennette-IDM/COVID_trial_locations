@@ -1,4 +1,21 @@
+---
+title: "Exploration of clinical trial locations"
+author: "Carrie Bennette"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+bs_theme: "cosmo"
+params:
+  date: "July 6, 2020"
+---
 
+Git hash: `r git2r::branch_target(git2r::head(git2r::repository(getwd())))`
+
+[GitHub repo](https://github.com/CBennette-IDM/COVID_clinical_trial_locations)
+
+```{r setup, include=FALSE}
 # load libraries
 library(tidyr)
 library(RPostgreSQL)
@@ -20,9 +37,18 @@ library(sp)
 library(spdep)
 library(INLA)
 library(kableExtra)
-library(usmap)
-library(lme4)
+library(pscl)
+library(boot)
+library(glmmTMB)
 
+# options
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE) 
+knitr::opts_chunk$set(fig.width=10, fig.height=5, fig.align = "center") 
+options(scipen=10000)
+
+```
+
+```{r prep, include = FALSE, cache = TRUE}
 #### PREP DATA ####
 
 # Load multiple data sources 
@@ -33,9 +59,8 @@ library(lme4)
 # 5) hospital data (individual aggregated to county-level) from Medicare/CMS
 # 6) universities (https://hifld-geoplatform.opendata.arcgis.com/datasets/colleges-and-universities)
 
-
 # load Cytel tracker data (downloaded from their website: )
-trials <- read.csv("table_trials - 2020-06-30.csv") %>%
+trials <- read.csv("table_trials - 2020-07-08.csv") %>%
   filter(Country == "United States") %>%
   select(-Province) %>% 
   rename(nct_id = ID)
@@ -196,7 +221,11 @@ trials_census <- census_clean %>%
   mutate(state = substring(GEOID, 1, 2)) %>%
   filter(state != 72) # remove puerto rico
 
-#### LOOK AT DATA ####
+
+```
+
+
+```{r crosstabs}
 
 ## number of counties, number of individuals, and number of cases:
 CrossTab <- function(data, case, trial){
@@ -244,52 +273,38 @@ CrossTab(trials_census, cases_april, total_april)
 CrossTab(trials_census, cases_may, total_may)
 CrossTab(trials_census, cases_june, total_june)
 
+# and what proportion of the cases without trials are in counties with 100+ cases
+# 100+ cases in June?
+high_pop <- trials_census %>% filter(cases > 1000 & total == 0) %>% summarise(sum = sum(cases))
+low_pop <- trials_census %>% filter(cases <= 1000 & total == 0) %>% summarise(sum = sum(cases))
+
+high_pop/(high_pop+low_pop)
+
+june_high_pop <- trials_census %>% filter(cases_june > 100 & total == 0) %>% summarise(sum = sum(cases_june))
+june_low_pop <- trials_census %>% filter(cases_june <= 100 & total == 0) %>% summarise(sum = sum(cases_june))
+
+june_high_pop/(june_high_pop+june_low)
+```
+
+```{r gini}
 # Gini coefficients
-gini <- rbind(c("march", Gini(trials_census$total_march, trials_census$cases_march)),
+gini_total <- rbind(c("march", Gini(trials_census$total_march, trials_census$cases_march)),
               c("april", Gini(trials_census$total_april, trials_census$cases_april)),
               c("may", Gini(trials_census$total_may, trials_census$cases_may)),
               c("june", Gini(trials_census$total_june, trials_census$cases_june)))
-gini
+gini_total
 
 # look at persistence over time; just trials launched by month (taking out trials that remained open for months)
-gini <- rbind(c("march", Gini(trials_census$launched_march, trials_census$cases_march)),
+gini_new <- rbind(c("march", Gini(trials_census$launched_march, trials_census$cases_march)),
               c("april", Gini(trials_census$launched_april, trials_census$cases_april)),
               c("may", Gini(trials_census$launched_may, trials_census$cases_may)),
               c("june", Gini(trials_census$launched_june, trials_census$cases_june)))
-gini
+gini_new
 
+```
 
-ggplot(trials_census, aes(total_march, total_june)) +
-  geom_jitter(alpha = 0.1, color = "blue") + 
-  theme_minimal()
+```{r models}
 
-ggplot(trials_census, aes(launched_march, launched_june)) +
-  geom_jitter(alpha = 0.1, color = "blue") + 
-  theme_minimal()
-
-#### SIMPLE PLOTS ####
-map_data <- trials_census %>%
-  mutate(ratio_march = pmin(pmax(enrollment_march / cases_march, 0, na.rm = T), 2),
-         ratio_april = pmin(pmax(enrollment_april / cases_april, 0, na.rm = T), 2),
-         ratio_may = pmin(pmax(enrollment_may / cases_may, 0, na.rm = T), 2),
-         ratio_june = pmin(pmax(enrollment_june / cases_june, 0, na.rm = T), 2))
-
-# QUICK UGLY PLOTS
-plot_usmap(data = map_data, values = "ratio_march", size = 0.1 , color = "white") + 
-  scale_fill_continuous(low = "blue", 
-                        high = "red", 
-                        name = "Enrollment to case ratio (March)", 
-                        label = scales::comma) + 
-  theme(legend.position = "right")
-
-plot_usmap(data = map_data, values = "ratio_june", size = 0.1 , color = "white") + 
-  scale_fill_continuous(low = "blue", 
-                        high = "red", 
-                        name = "Enrollment to case ratio (June)", 
-                        label = scales::comma) + 
-  theme(legend.position = "right")
-
-#### VERY SIMPLE MODELS ####
 first_date <- cases %>%
   group_by(fips) %>%  
   summarise(date = min(date),
@@ -297,38 +312,141 @@ first_date <- cases %>%
 
 trials_model <- trials_census %>%
   left_join(first_date, by = c("GEOID" = "fips")) %>%
-  mutate(days = ifelse(is.na(days), 0, days))
+  mutate(days = ifelse(is.na(days), 0, days)) %>%
+  mutate(countyfips = fips)
 
-# zero inflated negative binomial:
-zinb <- zeroinfl(total ~ 1 + 
-               POPPCT_URBAN + 
-               log(hospitals + 1) +
-               log(population) +
-               log(cases + 1) + 
-               black_aa +
-               lths_education + 
-               hispanic +
-               poverty + 
-               days, 
-             data = trials_model,
-             dist = "negbin")
-summary(zinb)
+write_csv(trials_model, "coviddata.csv")
 
-# by month:
-zinb <- zeroinfl(total_april ~ 1 + 
-                   POPPCT_URBAN + 
-                   log(hospitals + 1) +
-                   
-                   log(cases_march + 1) + 
-                   black_aa +
-                   lths_education + 
-                   hispanic +
-                   poverty + 
-                   days + 
-                   offset(log(population)), 
-                 data = trials_model,
-                 dist = "negbin")
-summary(zinb)
+#### REGRESSION MODELS ####
+# negative binomial:
+m1 <- glmmTMB(total ~ 1 + 
+              POPPCT_URBAN  + 
+              log(hospitals + 1) +
+              log(cases + 1) + 
+              black_aa + 
+              white_race + 
+              hispanic + 
+              poverty +
+              age75_plus +
+              days + (1|state),
+             offset = (log(population)),
+             family = nbinom1,
+            data = trials_model)
+summary(m1)
+
+
+```
+
+
+```{r, eval = F}
+
+fit_model <- function(input) {
+  
+  # manually resample data (with replacement)
+  sampled_data <- dat[sample(nrow(dat), replace = TRUE),]
+  
+  # zero inflated NB model
+  m <- zeroinfl(total ~ 
+                  POPPCT_URBAN + 
+                  log_beds + 
+                  insurance +
+                  log_case + 
+                  black_aa +
+                  lths_education + 
+                  hispanic +
+                  poverty  +
+                  days, 
+                offset = log(population),
+                data = sampled_data)
+
+  # recycled predictions 
+  model_table <- t(sapply(names(summary(m)$coefficients$count[,1])[-1], function(var_name){
+    delta <- quantile(sampled_data[[var_name]], 
+                      p = c(0.1, 0.9), na.rm = TRUE)
+    newdata1 <- sampled_data
+    newdata1[[var_name]] <- delta[1]
+    phat1 <- predict(m, newdata1)
+    newdata2 <- sampled_data
+    newdata2[[var_name]] <- delta[2]
+    phat2 <- predict(m, newdata2)
+    diff[[var_name]] <- mean(phat2, na.rm = T)/ mean(phat1, na.rm = T)
+    return(diff[[var_name]])
+  }))
+  return(model_table)
+}
+
+set.seed(10)
+reps = 10
+results <- matrix(NA, reps, length(summary(m)$coefficients$count[,1])-1)
+for (i in 1:reps){
+  results[i,] <- fit_model(dat)
+}
+colnames(results) <- names(summary(m)$coefficients$count[,1])[-1]
+results <- as.data.frame(results)
+results
+
+```
+
+
+```{r spatial, eval = F}
+
+library(rgdal); library(maptools); library(maps);library(raster);library(spdep)
+library(INLA);library(dplyr);library(ggplot2);library(readr);library(ggthemes)
+library(labelled); library(ggsci); library(htmlwidgets); library(plotly);
+library(grid); library(gridExtra)
+library(labelled)
+
+### Preparing the Shapefile ##########
+
+full_state<- shapefile("cb_2018_us_state_500k")
+# plot(coordinates(full_state))
+# states<-crop(full_state,extent(-175,-55,19,70))
+states<-crop(full_state,extent(-175,-55,19,50))
+# plot(coordinates(states))
+# adding a variable for merging with the case data
+states@data<-states@data%>%mutate(statefp=as.numeric(GEOID))
+states@data$id<-rownames(states@data)
+
+### Preparing the Case /County_COVID/Data ##########
+dat <- read_csv("coviddata.csv") %>%
+  mutate(statefp = as.numeric(state),
+         log_pop = log(population),
+         log_case = log(cases + 1),
+         log_hospitals = log(hospitals + 1))
+x <- table(dat$countyfips)
+
+### Labeling data for tables ##########
+label_frame <- list(
+  c("log_pop", "Population"),
+  c("log_case", "COVID-19 cases"),
+  c("log_hospitals", "Number of hospitals"),
+  c("black_aa", "Pct. black"),
+  c("lths_education", "Pct. less than HS education"),
+  c("POPPCT_URBAN", "Urbanicity score"),
+  c("poverty", "Pct. living below poverty line"),
+  c("hispanic", "Pct. hispanic"),
+  c("days", "Days since first case")
+)
+
+# label data
+lapply(label_frame, function(x){
+  var_label(dat[[x[1]]]) <<- x[2]
+})
+
+# make adjacency matrix and add to data
+nb.r <- poly2nb(states, queen = T)
+mat <- nb2mat(nb.r, style="B",zero.policy=TRUE) 
+
+# -- add state ID that corresponds to the adjacency matrix into the data -- #
+StateIDs <- states@data[,c("statefp","id")] %>% 
+  mutate(id=as.numeric(id))
+
+dat <- dat %>% 
+  left_join(StateIDs) %>%
+  mutate(id=as.numeric(id)) %>%
+  mutate(log_beds = log(hospital_beds + 1),
+         log_cases = log(cases + 1),
+         log_pop = log(population))
 
 #### SPATIAL MODELS ####
 census_sf <- raw_census %>%
@@ -345,274 +463,9 @@ plot(st_geometry(census_sf), border="grey")
 census_nb <- poly2nb(census_sf, queen=T)
 census_w<-nb2listw(census_nb, style="W", zero.policy = TRUE)
 
-moran.plot(census_sf$total, census_w,
-           xlab = "# of trials",
-           ylab = "Neighbors # trials")
-
 moran.test(census_sf$total/census_sf$population, census_w, 
            alternative = "two.sided",
            zero.policy = TRUE)    
 # there is no spatial autocorrelation in # trials/population...
-# Estimate: -0.002 and p-value = 0.9... certainly makes my life easier.
-
-plot.nb(sf_nb, coords, add=T)
-nb2INLA("~/usa.graph", sf_nb)
-usa.adj <- paste("~/usa.graph")
-
-census_sf$ID.area<-seq(1,nrow(census_sf))
-
-# start with poisson model
-model <- total_march ~ f(ID.area, model="bym", 
-                      graph = usa.adj, 
-                      adjust.for.con.comp = FALSE) + 
-  POPPCT_URBAN + 
-  log(hospital_beds + 1) +
-  scale(universities) + 
-  log(cases_march + 1) + 
-  black_aa +
-  college_education + 
-  hispanic +
-  medianincome 
-  
-result <- inla(model,
-               family = "poisson",
-               data = census_sf, E = population,
-               control.compute=list(dic = TRUE, cpo = TRUE))
-
-summary(result)
-
-
-
-model <- total_april ~ f(ID.area, model="bym", 
-                         graph = usa.adj, 
-                         adjust.for.con.comp = FALSE) + 
-  POPPCT_URBAN + 
-  log(hospital_beds + 1) +
-  log(universities + 1) + 
-  log(cases_march + 1) + 
-  black_aa +
-  college_education + 
-  hispanic +
-  poverty
-
-result <- inla(model,
-               family = "poisson",
-               data = census_sf, E = population,
-               control.compute=list(dic = TRUE, cpo = TRUE))
-
-summary(result)
-
-
-model <- total ~ f(ID.area, model="bym", 
-                         graph = usa.adj, 
-                         adjust.for.con.comp = FALSE) + 
-  POPPCT_URBAN + 
-  log(hospital_beds + 1) +
-  log(universities + 1) + 
-  log(cases_march + 1) + 
-  log(cases_april + 1) +
-  log(cases_may + 1) + 
-  log(cases_june + 1) + 
-  black_aa +
-  college_education + 
-  hispanic +
-  poverty
-
-may <- inla(model,
-               family = "poisson",
-               data = census_sf, E = population,
-               control.compute=list(dic = TRUE, cpo = TRUE))
-
-summary(may)
-
-result <- inla(model,
-               family = "nbinomial",
-               data = census_sf, E = population,
-               control.compute=list(dic = TRUE, cpo = TRUE))
-
-summary(result)
-
-
-
-# make adjacency matrix and add to data
-nb.r <- poly2nb(census_sf, queen = FALSE)
-mat <- nb2mat(nb.r, style = "B", zero.policy = TRUE) 
-
-# add ID
-census_sf$ID.area<-seq(1,nrow(census_sf))
-
-# source functions
-source("model_functions.R")
-
-# regression formula
-model_formula <- paste0(
-  "POPPCT_URBAN + 
-  log(hospital_beds + 1) +
-  log(universities + 1) + 
-  log(cases+1) + 
-  black_aa +
-  hs_education +
-  college_education + 
-  hispanic +
-  medianincome +
-  poverty +
-  days"
-)
-
-# case model
-case_model <- fit_model(dat = trials_model, 
-                        states = state,
-                        model_outcome = "total",
-                        model_formula = model_formula) 
-
-#### SCRATCH ####
-
-
-
-model <- summary(glm(total ~ 1 + 
-                       POPPCT_URBAN + 
-                       poverty +
-                       offset(log(population)), 
-                     family = "poisson", 
-                     data = trials_census))
-model
-
-#### 
-p <- ggplot() +
-  geom_smooth(trials_census %>% filter(cases_march < 70000), mapping = aes(cases_march, total_march, weight = population)) +
-  geom_point(trials_census %>% filter(cases_march < 70000), mapping = aes(cases_march, total_march, size = population), color = "red", alpha = 0.3) +
-  geom_smooth(trials_census %>% filter(cases_april < 70000), mapping = aes(cases_april, total_april, weight = population)) +
-  geom_point(trials_census %>% filter(cases_april < 70000), mapping = aes(cases_april, total_april, size = population), color = "blue", alpha = 0.3) +
-  geom_smooth(trials_census %>% filter(cases_may < 70000), mapping = aes(cases_may, total_may, weight = population)) +
-  geom_point(trials_census %>% filter(cases_may < 70000), mapping = aes(cases_may, total_may, size = population), color = "black", alpha = 0.3) +
-  theme_minimal()
-
-p
-
-
-# some exploratory plots; let's see what we're working with here
-p <- ggplot(trials_census %>% filter(cases <50000),  aes(cases, total, size = population)) +
-  geom_smooth() +
-  geom_jitter(aes(color = black_aa), alpha = 0.5) +
-  ggtitle("Total number of COVID trials open in a county vs number of COVID cases") +
-  ylab("") +
-  scale_color_gradient(low = "red", high = "blue") +
-  theme_minimal()
-p
-
-# for predominanting black communities?
-p <- ggplot() +
-  geom_smooth(trials_census %>% filter(hispanic >= 10 & cases <50000),  
-              mapping = aes(cases, total), color = "blue") +
-  geom_smooth(trials_census %>% filter(hispanic < 10 & cases <50000), 
-              mapping =  aes(cases, total), color = "red") 
-p
-
-# how many counties have/don't have even a single trial?
-
-table <- trials_census %>%
-  summarize(cases0_trials0 = sum(cases == 0 & total == 0),
-            cases1_trials0 = sum(cases >= 1 & total == 0),
-            cases10_trials0 = sum(cases >= 10 & total == 0),
-            cases100_trials0 = sum(cases >= 100 & total == 0),
-            cases1000_trials0 = sum(cases >= 1000 & total == 0),
-            cases10000_trials0 = sum(cases >= 10000 & total == 0),
-            cases0 = sum(cases == 0),
-            cases1 = sum(cases >= 1),
-            cases10 = sum(cases >= 10 ),
-            cases100 = sum(cases >= 100),
-            cases1000 = sum(cases >= 1000),
-            cases10000 = sum(cases >= 10000))
-            
-# population living in counties with at least one case and no trials:
-no_trial <- trials_census %>%
-  filter(cases >= 1 & total == 0) %>%
-  summarise(mean_pop = weighted.mean(population)*n())
-
-# population living in counties with at least one case and at least one trial:
-yes_trial <- trials_census %>%
-  filter(cases >= 1 & total > 0) %>%
-  summarise(mean_pop = weighted.mean(population)*n())
-
-# population living in counties with at least 100 cases and no trials:
-no_trial <- trials_census %>%
-  filter(cases >= 100 & total == 0) %>%
-  summarise(mean_pop = weighted.mean(population)*n())
-
-# population living in counties with at least 100 cases and at least one trial:
-yes_trial <- trials_census %>%
-  filter(cases >= 100 & total > 0) %>%
-  summarise(mean_pop = weighted.mean(population)*n())
-
-
-# population living in counties with at least 1000 cases and no trials:
-no_trial <- trials_census %>%
-  filter(cases >= 1000 & total == 0) %>%
-  summarise(mean_pop = weighted.mean(population)*n())
-
-# population living in counties with at least 1000 cases and at least one trial:
-yes_trial <- trials_census %>%
-  filter(cases >= 1000 & total > 0) %>%
-  summarise(mean_pop = weighted.mean(population)*n())
-
-
-# population living in counties with at least 10k cases and no trials:
-no_trial <- trials_census %>%
-  filter(cases >= 10000 & total == 0) %>%
-  summarise(mean_pop = weighted.mean(population)*n())
-
-# population living in counties with at least 10k cases and at least one trial:
-yes_trial <- trials_census %>%
-  filter(cases >= 10000 & total > 0) %>%
-  summarise(mean_pop = weighted.mean(population)*n())
-
-
-summary(glm(total_pts ~ 1 + 
-                  black_aa + 
-                  hispanic + 
-                  asian +
-                  POPPCT_URBAN +
-                  population , 
-             family = "poisson", 
-            data = trials_census))
-
-
-april <- summary(glm(total ~ 1 + 
-              POPPCT_URBAN + 
-              age75_plus +
-              log(hospital_beds + 0.001) +
-              log(cases + 0.001) + 
-              black_aa + 
-              hispanic +
-              asian +
-              poverty +
-              offset(log(population)), 
-            family = "poisson", 
-            data = trials_census))
-
-summary(glm(total ~ 1 + 
-              POPPCT_URBAN +
-              cases +
-              black_aa + 
-              hispanic +
-              white_race +
-              asian +
-              poverty + 
-              insurance +
-              offset(log(population)), 
-            family = "poisson", 
-            data = trials_census, weights = population))
-
-summary(glm(total > 0 ~ 1 + 
-              black_aa + 
-              cases +
-              hispanic +
-              asian, 
-            family = "binomial", 
-            data = trials_census,
-            weights = population))
-
-
-
-
-
+# Estimate: -0.003 and p-value = 0.8... certainly makes my life easier.
+```

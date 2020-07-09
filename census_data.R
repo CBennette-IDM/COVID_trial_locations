@@ -45,9 +45,11 @@ raw_census <- get_acs(geography = "county",
                                     median_age = "B01002_001",
                                     white_race = "B02008_001"),
                       # 2018 is latest year available
-                      year = 2018)
+                      year = 2018,
+                      geometry = TRUE)
 
 census_clean <- raw_census %>%
+  st_drop_geometry() %>%
   pivot_wider(names_from = variable, values_from = estimate) %>%
   group_by(GEOID) %>%
   summarize(population = mean(population, na.rm = T), # must be first
